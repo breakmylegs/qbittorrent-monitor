@@ -19,6 +19,8 @@ Issues and source: [breakmylegs/decky-plugins](https://github.com/breakmylegs/de
 https://github.com/breakmylegs/qbittorrent-monitor/releases/latest/download/qbittorrent-monitor.zip
 ```
 
+Needs Decky Loader 3.0.4 or later. If you installed 0.1.0 or earlier, uninstall it first, then install this one. Your settings are kept.
+
 ## Set up
 
 1. Open the plugin in the Quick Access Menu, then Show settings.

@@ -1,5 +1,5 @@
 {
-  "name": "qbittorrent-monitor",
+  "name": "qBittorrent Monitor",
   "author": "",
   "flags": ["debug"],
   "api_version": 1,
