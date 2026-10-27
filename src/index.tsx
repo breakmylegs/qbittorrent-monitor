@@ -29,6 +29,10 @@ import { useBackendEvent } from "./shared/useBackendEvent";
 import { AUTH_OPTIONS, authHelp, canStart, rowDetail, rowTitle } from "./rows";
 import type { AuthMode, QbtData, QbtSettings, Toast, Torrent } from "./types";
 
+// plugin.json "name", exactly. Decky lists the plugin by it and matches the
+// installed copy by it when Update now replaces the plugin.
+const PLUGIN_NAME = "qBittorrent Monitor";
+
 type Snap = Snapshot<QbtSettings, QbtData>;
 
 const backend = monitorBackend<QbtSettings, QbtData>();
@@ -221,7 +225,7 @@ function Content() {
           }
         />
         <OfflineBanner status={status} />
-        <UpdateBadge update={update} />
+        <UpdateBadge update={update} name={PLUGIN_NAME} />
         {online && server && (
           <PanelSectionRow>
             <ToggleField
@@ -309,7 +313,7 @@ export default definePlugin(() => {
   });
 
   return {
-    name: "qBittorrent Monitor",
+    name: PLUGIN_NAME,
     titleView: <div className={staticClasses.Title}>qBittorrent Monitor</div>,
     content: <Content />,
     icon: <FaMagnet />,
