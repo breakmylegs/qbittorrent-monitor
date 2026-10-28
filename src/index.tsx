@@ -26,6 +26,7 @@ import { StatusHeader } from "./shared/StatusHeader";
 import { shouldToast } from "./shared/toastOnce";
 import { PanelBoundary } from "./shared/PanelBoundary";
 import { UpdateBadge } from "./shared/UpdateBadge";
+import { UpdatesSection } from "./shared/UpdatesSection";
 import { useBackendEvent } from "./shared/useBackendEvent";
 import { AUTH_OPTIONS, authHelp, canStart, rowDetail, rowTitle } from "./rows";
 import type { AuthMode, QbtData, QbtSettings, Toast, Torrent } from "./types";
@@ -277,6 +278,7 @@ function Content() {
         </PanelSection>
       )}
 
+      <UpdatesSection update={update} name={PLUGIN_NAME} check={() => backend.checkUpdate(true)} />
       <PanelSection title="Settings">
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={() => setShowSettings(!showSettings)}>
