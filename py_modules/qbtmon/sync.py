@@ -86,6 +86,8 @@ def activity_key(torrent: dict[str, Any]) -> tuple:
 
 def project_torrent(hash_: str, torrent: dict[str, Any]) -> dict[str, Any]:
     eta = int(_num(torrent.get("eta"), states.INFINITE_ETA))
+    # "priority" is the queue position. 0 or -1 means not in the queue.
+    position = int(_num(torrent.get("priority")))
     return {
         "hash": hash_,
         "name": str(torrent.get("name") or ""),
@@ -98,23 +100,99 @@ def project_torrent(hash_: str, torrent: dict[str, Any]) -> dict[str, Any]:
         "stopped": states.is_stopped(torrent.get("state")),
         "size": int(_num(torrent.get("size"))),
         "category": str(torrent.get("category") or ""),
+        "force_start": bool(torrent.get("force_start")),
+        "queue_pos": position if position > 0 else None,
+        "ratio": round(_num(torrent.get("ratio")), 2),
+    }
+
+
+def _downloading(torrent: dict[str, Any]) -> bool:
+    return _num(torrent.get("progress")) < 1 and not states.is_stopped(torrent.get("state"))
+
+
+def _optional_int(server: dict[str, Any], key: str) -> int | None:
+    return int(_num(server.get(key))) if key in server else None
+
+
+def project_server(data: MainData) -> dict[str, Any]:
+    server = data.server_state
+    dl_speed = int(_num(server.get("dl_info_speed")))
+    left = sum(int(_num(t.get("amount_left"))) for t in data.torrents.values() if _downloading(t))
+    eta = int(left / dl_speed) if left and dl_speed > 0 else None
+    ratio = _num(server.get("global_ratio"), -1)
+    return {
+        "dl_speed": dl_speed,
+        "up_speed": int(_num(server.get("up_info_speed"))),
+        "alt_speed": bool(server.get("use_alt_speed_limits")),
+        "connection_status": str(server.get("connection_status") or ""),
+        "free_space": _optional_int(server, "free_space_on_disk"),
+        # The limits for the current mode, normal or alternative. 0 means none.
+        "dl_limit": int(_num(server.get("dl_rate_limit"))),
+        "up_limit": int(_num(server.get("up_rate_limit"))),
+        "dl_session": _optional_int(server, "dl_info_data"),
+        "up_session": _optional_int(server, "up_info_data"),
+        "ratio": round(ratio, 2) if ratio >= 0 else None,
+        "dht_nodes": _optional_int(server, "dht_nodes"),
+        "queueing": bool(server.get("queueing")),
+        # qBittorrent 5.3 and later only. None means the server cannot pause the session.
+        "session_paused": bool(server["session_state"]) if "session_state" in server else None,
+        "left": left,
+        "eta": eta if eta is None or eta < states.INFINITE_ETA else None,
     }
 
 
 def project(data: MainData, limit: int = TOP_N) -> dict[str, Any]:
     ordered = sorted(data.torrents.items(), key=lambda item: activity_key(item[1]))
-    server = data.server_state
     return {
         "torrents": [project_torrent(h, t) for h, t in ordered[:limit]],
         "total": len(data.torrents),
         "active": sum(1 for t in data.torrents.values() if t.get("state") in states.ACTIVE_STATES),
-        "server": {
-            "dl_speed": int(_num(server.get("dl_info_speed"))),
-            "up_speed": int(_num(server.get("up_info_speed"))),
-            "alt_speed": bool(server.get("use_alt_speed_limits")),
-            "connection_status": str(server.get("connection_status") or ""),
-            "free_space": int(_num(server.get("free_space_on_disk"))) if "free_space_on_disk" in server else None,
-        },
+        "server": project_server(data),
+        "categories": sorted(str(name) for name in data.categories),
+    }
+
+
+# Full list filters. Each takes the raw torrent from the maindata cache.
+FILTERS = {
+    "all": lambda t: True,
+    "downloading": _downloading,
+    "seeding": lambda t: states.label(t.get("state")) == states.SEEDING,
+    "completed": lambda t: _num(t.get("progress")) >= 1,
+    "stopped": lambda t: states.is_stopped(t.get("state")),
+    "active": lambda t: _num(t.get("dlspeed")) + _num(t.get("upspeed")) > 0,
+    "error": lambda t: states.label(t.get("state")) == states.ERROR,
+}
+
+SORTS = {
+    "activity": lambda item: activity_key(item[1]),
+    "name": lambda item: str(item[1].get("name") or "").lower(),
+    "added": lambda item: -_num(item[1].get("added_on")),
+    "size": lambda item: -_num(item[1].get("size")),
+}
+
+LIST_LIMIT = 100
+
+
+def list_torrents(data: MainData, filter_id: str = "all", category: str | None = None, sort: str = "activity",
+                  limit: int = LIST_LIMIT) -> dict[str, Any]:
+    """Torrents for the full-screen list. `category` None means any, "" means none set."""
+    if filter_id not in FILTERS:
+        raise ValueError("unknown filter")
+    if sort not in SORTS:
+        raise ValueError("unknown sort")
+    keep = FILTERS[filter_id]
+    # A poll thread may add or remove torrents meanwhile. Copy the items first.
+    items = list(data.torrents.items())
+    matched = [
+        (h, t) for h, t in items
+        if keep(t) and (category is None or str(t.get("category") or "") == category)
+    ]
+    matched.sort(key=SORTS[sort])
+    return {
+        "torrents": [project_torrent(h, t) for h, t in matched[:limit]],
+        "matched": len(matched),
+        "total": len(data.torrents),
+        "limit": limit,
     }
 
 

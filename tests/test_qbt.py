@@ -341,3 +341,209 @@ def test_import_rejects_unknown_auth_mode(tmp_path):
     path.write_text(json.dumps({"auth_mode": "magic"}))
     result = service.import_from_file()
     assert result["ok"] is False and service.settings.get("auth_mode") == "api_key"
+
+
+# Server stats, limits, queue and the full list
+
+
+def _configured(mock, tmp_path, events=None, **kwargs):
+    server = mock(api_key=KEY, **kwargs)
+    service = make_service(tmp_path, events)
+    service.save_settings({"base_url": server.url})
+    service.set_secret("api_key", KEY)
+    return server, service
+
+
+def test_projection_server_stats_and_totals(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    _run(service.poller.poll_once())
+    data = service.last_data
+    s = data["server"]
+    assert s["free_space"] == 100_000_000_000 and s["dl_session"] == 5_000_000_000
+    assert s["up_session"] == 1_200_000_000 and s["ratio"] == 1.25 and s["dht_nodes"] == 312
+    assert s["queueing"] is True and s["session_paused"] is False
+    assert s["dl_limit"] == 0 and s["up_limit"] == 0
+    # Only the running download counts. The stopped one is left out of the total.
+    assert s["left"] == 2_320_000_000 and s["eta"] == 2_320_000_000 // 2_000_000
+    assert data["categories"] == ["data", "iso"]
+    first = data["torrents"][0]
+    assert first["queue_pos"] == 1 and first["force_start"] is False and first["ratio"] == 0.01
+
+
+def test_projection_without_optional_server_fields():
+    data = MainData()
+    data.apply({"rid": 1, "full_update": True, "torrents": {}, "server_state": {"dl_info_speed": 0}})
+    s = project(data)["server"]
+    assert s["free_space"] is None and s["session_paused"] is None and s["ratio"] is None
+    assert s["eta"] is None and s["left"] == 0
+
+
+def test_session_pause_needs_5_3(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    assert _run(service.set_session_paused(True)) == {"ok": True}
+    assert server.state.session_paused is True
+    assert _run(service.set_session_paused(False)) == {"ok": True}
+    assert server.state.session_paused is False
+
+    old, old_service = _configured(mock, tmp_path / "old", webapi="2.15.1", version="v5.2.0")
+    result = _run(old_service.set_session_paused(True))
+    assert result["ok"] is False and "5.3" in result["error"]["message"]
+
+
+def test_speed_limits(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    assert _run(service.set_speed_limit("download", 5_000_000)) == {"ok": True}
+    assert _run(service.set_speed_limit("upload", 500_000)) == {"ok": True}
+    assert server.state.dl_limit == 5_000_000 and server.state.up_limit == 500_000
+    assert ("POST", "transfer/setDownloadLimit", {"limit": "5000000"}) in server.state.calls
+    for bad in (-1, True, "5", 1.5):
+        assert _run(service.set_speed_limit("download", bad))["ok"] is False
+    assert _run(service.set_speed_limit("sideways", 0))["ok"] is False
+
+
+def test_force_start_reannounce_and_queue(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    assert _run(service.set_force_start([C], True)) == {"ok": True}
+    assert server.state.torrents[C]["force_start"] is True
+    assert ("POST", "torrents/setForceStart", {"hashes": C, "value": "true"}) in server.state.calls
+    assert _run(service.torrent_action("reannounce", [A])) == {"ok": True}
+    assert _run(service.queue_move([C], "top")) == {"ok": True}
+    assert server.state.torrents[C]["priority"] == 1
+    assert _run(service.queue_move([C], "sideways"))["ok"] is False
+
+    server.state.queueing = False
+    result = _run(service.queue_move([C], "bottom"))
+    assert result["ok"] is False and "queueing is off" in result["error"]["message"]
+
+
+def test_set_category(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    _run(service.poller.poll_once())
+    assert _run(service.set_category([B], "iso")) == {"ok": True}
+    assert server.state.torrents[B]["category"] == "iso"
+    assert _run(service.set_category([B], "")) == {"ok": True}
+    assert server.state.torrents[B]["category"] == ""
+    assert _run(service.set_category([B], "missing"))["ok"] is False
+
+
+def test_list_torrents_filters_and_sorts(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    _run(service.poller.poll_once())
+    everything = service.list_torrents("all", None, "name")
+    assert [t["name"] for t in everything["torrents"]] == ["Example Linux ISO", "Open dataset", "Public domain film"]
+    assert everything["matched"] == 3 and everything["total"] == 3
+    assert [t["hash"] for t in service.list_torrents("downloading", None, "activity")["torrents"]] == [A]
+    assert [t["hash"] for t in service.list_torrents("seeding", None, "activity")["torrents"]] == [B]
+    assert [t["hash"] for t in service.list_torrents("stopped", None, "activity")["torrents"]] == [C]
+    assert [t["hash"] for t in service.list_torrents("all", "data", "activity")["torrents"]] == [C]
+    assert [t["hash"] for t in service.list_torrents("all", "", "activity")["torrents"]] == [B]
+    assert [t["hash"] for t in service.list_torrents("all", None, "size")["torrents"]] == [C, A, B]
+    assert service.list_torrents("nonsense", None, "name")["ok"] is False
+    assert service.list_torrents("all", None, "nonsense")["ok"] is False
+
+
+def test_route_keeps_fast_poll(tmp_path):
+    service = make_service(tmp_path)
+    service.set_route_visible(True)
+    service.set_visible(False)
+    assert service.poller.visible is True
+    service.set_route_visible(False)
+    assert service.poller.visible is False
+
+
+# Game-time alternative speed limits
+
+
+def _game(service, running):
+    async def scenario():
+        service.set_game_running(running)
+        if service._game_task:
+            await service._game_task
+
+    _run(scenario())
+
+
+def test_game_alt_speed_is_off_by_default(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    _game(service, True)
+    assert server.state.alt_speed is False
+
+
+def test_game_alt_speed_on_and_restored(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    _game(service, True)
+    assert server.state.alt_speed is True
+    _game(service, False)
+    assert server.state.alt_speed is False
+    assert service.game_memory.get() is None
+
+
+def test_game_alt_speed_leaves_a_user_choice_alone(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    server.state.alt_speed = True
+    _game(service, True)
+    _game(service, False)
+    assert server.state.alt_speed is True
+
+    # The user turns it off during the game. Nothing is turned back on or off later.
+    server.state.alt_speed = False
+    _game(service, True)
+    assert server.state.alt_speed is True
+    server.state.alt_speed = False
+    _game(service, False)
+    assert server.state.alt_speed is False and service.game_memory.get() is None
+
+
+def test_game_alt_speed_undo_retries_after_a_failure(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    _game(service, True)
+    server.state.down = True
+    _game(service, False)
+    # The undo failed, so the record stays for the next successful poll.
+    assert service.game_memory.get()["alt_speed"] is True
+    server.state.down = False
+    _run(service.poller.poll_once())
+    assert server.state.alt_speed is False and service.game_memory.get() is None
+
+
+def test_game_alt_speed_sets_the_mode_outright(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    _game(service, True)
+    assert ("POST", "transfer/setSpeedLimitsMode", {"mode": "1"}) in server.state.calls
+    old, old_service = _configured(mock, tmp_path / "old", set_mode=False)
+    old_service.save_settings({"game_alt_speed": True})
+    _game(old_service, True)
+    assert old.state.alt_speed is True, "falls back to read and toggle on a 404"
+    _game(old_service, False)
+    assert old.state.alt_speed is False
+
+
+def test_game_undo_waits_until_the_panel_reports(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    _game(service, True)
+    # Decky restarts mid-game. The new backend polls before the frontend reports.
+    fresh = make_service(tmp_path)
+    _run(fresh.poller.poll_once())
+    assert server.state.alt_speed is True, "a game may still be running"
+    _game(fresh, True)
+    _run(fresh.poller.poll_once())
+    assert server.state.alt_speed is True
+    _game(fresh, False)
+    assert server.state.alt_speed is False and fresh.game_memory.get() is None
+
+
+def test_game_record_from_another_server_is_dropped(mock, tmp_path):
+    server, service = _configured(mock, tmp_path)
+    service.save_settings({"game_alt_speed": True})
+    _game(service, True)
+    other = mock(api_key=KEY)
+    other.state.alt_speed = True
+    service.save_settings({"base_url": other.url})
+    _game(service, False)
+    assert other.state.alt_speed is True, "the other server is not touched"
+    assert service.game_memory.get() is None

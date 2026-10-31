@@ -69,6 +69,9 @@ class Plugin:
     async def set_visible(self, visible):
         self.service.set_visible(visible)
 
+    async def set_route_visible(self, visible):
+        self.service.set_route_visible(visible)
+
     async def set_game_running(self, running):
         self.service.set_game_running(running)
 
@@ -93,5 +96,32 @@ class Plugin:
     async def toggle_alt_speed(self):
         try:
             return await self.service.toggle_alt_speed()
+        except Exception as exc:  # noqa: BLE001
+            return error_result(exc)
+
+    async def _guard(self, coro):
+        try:
+            return await coro
+        except Exception as exc:  # noqa: BLE001
+            return error_result(exc)
+
+    async def set_force_start(self, hashes, value):
+        return await self._guard(self.service.set_force_start(hashes, value))
+
+    async def queue_move(self, hashes, where):
+        return await self._guard(self.service.queue_move(hashes, where))
+
+    async def set_category(self, hashes, category):
+        return await self._guard(self.service.set_category(hashes, category))
+
+    async def set_speed_limit(self, direction, limit):
+        return await self._guard(self.service.set_speed_limit(direction, limit))
+
+    async def set_session_paused(self, paused):
+        return await self._guard(self.service.set_session_paused(paused))
+
+    async def list_torrents(self, filter_id="all", category=None, sort="activity"):
+        try:
+            return self.service.list_torrents(filter_id, category, sort)
         except Exception as exc:  # noqa: BLE001
             return error_result(exc)

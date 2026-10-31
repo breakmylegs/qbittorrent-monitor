@@ -1,25 +1,31 @@
-import { addEventListener, callable, definePlugin, removeEventListener, toaster, useQuickAccessVisible } from "@decky/api";
+import {
+  addEventListener,
+  callable,
+  definePlugin,
+  removeEventListener,
+  routerHook,
+  toaster,
+  useQuickAccessVisible,
+} from "@decky/api";
 import {
   ButtonItem,
   ConfirmModal,
-  DialogButton,
   DropdownItem,
   Field,
-  Focusable,
-  ModalRoot,
   PanelSection,
   PanelSectionRow,
-  ProgressBar,
+  SliderField,
   TextField,
   ToggleField,
   showModal,
   staticClasses,
 } from "@decky/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FaMagnet } from "react-icons/fa";
 import { monitorBackend, type ActionResult, type Snapshot, type Status, type UpdateInfo } from "./shared/backend";
 import { ConnectionForm } from "./shared/ConnectionForm";
 import { formatSpeed } from "./shared/format";
+import { openPage } from "./shared/FullPage";
 import { watchGameRunning } from "./shared/gameState";
 import { OfflineBanner } from "./shared/OfflineBanner";
 import { StatusHeader } from "./shared/StatusHeader";
@@ -28,8 +34,20 @@ import { PanelBoundary } from "./shared/PanelBoundary";
 import { UpdateBadge } from "./shared/UpdateBadge";
 import { UpdatesSection } from "./shared/UpdatesSection";
 import { useBackendEvent } from "./shared/useBackendEvent";
-import { AUTH_OPTIONS, authHelp, canStart, rowDetail, rowTitle } from "./rows";
-import type { AuthMode, QbtData, QbtSettings, Toast, Torrent } from "./types";
+import {
+  AUTH_OPTIONS,
+  DOWNLOAD_PRESETS,
+  UPLOAD_PRESETS,
+  authHelp,
+  connectionNote,
+  leftSummary,
+  limitLabel,
+  presetIndex,
+  statsLines,
+} from "./rows";
+import { TorrentRow, failed, note, torrentAction } from "./torrents";
+import { TORRENTS_ROUTE, TorrentsPage } from "./TorrentsPage";
+import type { AuthMode, QbtData, QbtSettings, ServerState, Toast } from "./types";
 
 // plugin.json "name", exactly. Decky lists the plugin by it and matches the
 // installed copy by it when Update now replaces the plugin.
@@ -38,93 +56,135 @@ const PLUGIN_NAME = "qBittorrent Monitor";
 type Snap = Snapshot<QbtSettings, QbtData>;
 
 const backend = monitorBackend<QbtSettings, QbtData>();
-const torrentAction = callable<[action: "start" | "stop" | "recheck", hashes: string[] | "all"], ActionResult>(
-  "torrent_action",
-);
-const deleteTorrents = callable<[hashes: string[], deleteFiles: boolean], ActionResult>("delete_torrents");
 const toggleAltSpeed = callable<[], ActionResult>("toggle_alt_speed");
+const setSpeedLimit = callable<[direction: "download" | "upload", limit: number], ActionResult>("set_speed_limit");
+const setSessionPaused = callable<[paused: boolean], ActionResult>("set_session_paused");
 
-const note: React.CSSProperties = { fontSize: 12, lineHeight: 1.35 };
+const warnNote: React.CSSProperties = { ...note, color: "#e0a030" };
 
-function failed(res: ActionResult, what: string) {
-  if (!res.ok) toaster.toast({ title: `${what} failed`, body: res.error?.message ?? res.message ?? "Try again." });
-}
+// A notched slider over the presets. It waits for the stick to settle before it
+// sends the limit, so moving across notches sends one request, not several.
+function LimitSlider({
+  label,
+  presets,
+  limit,
+  direction,
+}: {
+  label: string;
+  presets: number[];
+  limit: number;
+  direction: "download" | "upload";
+}) {
+  const [index, setIndex] = useState(presetIndex(presets, limit));
+  const timer = useRef<number | undefined>(undefined);
+  // The notch waiting to be sent, or null.
+  const pending = useRef<number | null>(null);
+  const mounted = useRef(true);
+  const latest = useRef(limit);
+  latest.current = limit;
 
-function DeleteModal({ torrent, closeModal }: { torrent: Torrent; closeModal?: () => void }) {
-  const [withFiles, setWithFiles] = useState(false);
+  const send = async (value: number) => {
+    pending.current = null;
+    const res = await setSpeedLimit(direction, presets[value]);
+    failed(res, "Speed limit change");
+    // On failure, go back to the limit the server still has.
+    if (!res.ok && mounted.current) setIndex(presetIndex(presets, latest.current));
+  };
+  useEffect(() => {
+    if (pending.current === null) setIndex(presetIndex(presets, limit));
+  }, [limit]);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      window.clearTimeout(timer.current);
+      // The panel closed before the stick settled. Send the change anyway.
+      if (pending.current !== null) void send(pending.current);
+    },
+    [],
+  );
+  const onChange = (value: number) => {
+    setIndex(value);
+    pending.current = value;
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => void send(value), 700);
+  };
+  // A limit set elsewhere may sit between notches. Name the real value then.
+  const offPreset = pending.current === null && !presets.includes(limit);
   return (
-    <ConfirmModal
-      closeModal={closeModal}
-      strTitle="Delete torrent?"
-      strDescription={
-        <>
-          <div style={{ marginBottom: 12 }}>{torrent.name}</div>
-          <ToggleField
-            label="Also delete downloaded files"
-            description={withFiles ? "Files are removed from disk. This cannot be undone." : "Files stay on disk."}
-            checked={withFiles}
-            onChange={setWithFiles}
-          />
-        </>
+    <SliderField
+      label={label}
+      description={
+        <span style={note}>{offPreset ? `Now ${limitLabel(limit)}` : limitLabel(presets[index])}</span>
       }
-      strOKButtonText={withFiles ? "Delete torrent and files" : "Delete torrent"}
-      bDestructiveWarning={withFiles}
-      onOK={async () => failed(await deleteTorrents([torrent.hash], withFiles), "Delete")}
+      value={index}
+      min={0}
+      max={presets.length - 1}
+      step={1}
+      notchCount={presets.length}
+      notchTicksVisible
+      onChange={onChange}
     />
   );
 }
 
-function ActionsModal({ torrent, closeModal }: { torrent: Torrent; closeModal?: () => void }) {
-  const run = async (fn: () => Promise<ActionResult>, what: string) => {
-    closeModal?.();
-    failed(await fn(), what);
-  };
+function ServerSection({ server }: { server: ServerState }) {
+  const health = connectionNote(server);
+  const lines = statsLines(server);
   return (
-    <ModalRoot closeModal={closeModal}>
-      <div className={staticClasses.Title} style={{ marginBottom: 8 }}>
-        {torrent.name}
-      </div>
-      <div style={{ ...note, marginBottom: 16 }}>{rowDetail(torrent)}</div>
-      <Focusable style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {canStart(torrent) ? (
-          <DialogButton onClick={() => run(() => torrentAction("start", [torrent.hash]), "Start")}>Start</DialogButton>
-        ) : (
-          <DialogButton onClick={() => run(() => torrentAction("stop", [torrent.hash]), "Stop")}>Stop</DialogButton>
-        )}
-        <DialogButton onClick={() => run(() => torrentAction("recheck", [torrent.hash]), "Recheck")}>
-          Recheck
-        </DialogButton>
-        <DialogButton
-          onClick={() => {
-            closeModal?.();
-            showModal(<DeleteModal torrent={torrent} />);
-          }}
-        >
-          Delete...
-        </DialogButton>
-        <DialogButton onClick={() => closeModal?.()}>Close</DialogButton>
-      </Focusable>
-    </ModalRoot>
-  );
-}
-
-function TorrentRow({ torrent }: { torrent: Torrent }) {
-  return (
-    <PanelSectionRow>
-      <ButtonItem
-        layout="below"
-        bottomSeparator="none"
-        description={
-          <>
-            <ProgressBar nProgress={torrent.progress * 100} />
-            <div style={{ ...note, marginTop: 4 }}>{rowDetail(torrent)}</div>
-          </>
-        }
-        onClick={() => showModal(<ActionsModal torrent={torrent} />)}
-      >
-        <span style={{ fontSize: 13, wordBreak: "break-word" }}>{rowTitle(torrent)}</span>
-      </ButtonItem>
-    </PanelSectionRow>
+    <PanelSection title="Server">
+      <PanelSectionRow>
+        <ToggleField
+          label="Alternative speed limits"
+          checked={server.alt_speed}
+          onChange={async () => failed(await toggleAltSpeed(), "Speed limit change")}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <LimitSlider
+          label={server.alt_speed ? "Download limit (alternative)" : "Download limit"}
+          presets={DOWNLOAD_PRESETS}
+          limit={server.dl_limit}
+          direction="download"
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <LimitSlider
+          label={server.alt_speed ? "Upload limit (alternative)" : "Upload limit"}
+          presets={UPLOAD_PRESETS}
+          limit={server.up_limit}
+          direction="upload"
+        />
+      </PanelSectionRow>
+      {server.session_paused !== null && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            description={
+              <span style={note}>
+                {server.session_paused
+                  ? "Every torrent is held as it was. Resume to carry on."
+                  : "Stops all traffic but keeps each torrent's state, unlike Stop all."}
+              </span>
+            }
+            onClick={async () => failed(await setSessionPaused(!server.session_paused), "Pause all traffic")}
+          >
+            {server.session_paused ? "Resume all traffic" : "Pause all traffic"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      {(lines.length > 0 || health) && (
+        <PanelSectionRow>
+          <Field focusable bottomSeparator="none" childrenLayout="below">
+            {lines.map((line) => (
+              <div key={line} style={note}>
+                {line}
+              </div>
+            ))}
+            {health && <div style={health.warn ? warnNote : note}>{health.text}</div>}
+          </Field>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
   );
 }
 
@@ -213,6 +273,9 @@ function Content() {
         ? [{ name: "api_key", label: "API key" }]
         : [];
 
+  const left = server && online ? leftSummary(server) : null;
+  const context = { queueing: server?.queueing ?? false, categories: data?.categories ?? [] };
+
   return (
     <>
       <PanelSection>
@@ -222,21 +285,13 @@ function Content() {
             server && online ? (
               <span style={note}>
                 down {formatSpeed(server.dl_speed)} | up {formatSpeed(server.up_speed)}
+                {left && <div>{left}</div>}
               </span>
             ) : undefined
           }
         />
         <OfflineBanner status={status} />
         <UpdateBadge update={update} name={PLUGIN_NAME} />
-        {online && server && (
-          <PanelSectionRow>
-            <ToggleField
-              label="Alternative speed limits"
-              checked={server.alt_speed}
-              onChange={async () => failed(await toggleAltSpeed(), "Speed limit change")}
-            />
-          </PanelSectionRow>
-        )}
       </PanelSection>
 
       {online && data && (
@@ -247,10 +302,17 @@ function Content() {
             </PanelSectionRow>
           )}
           {data.torrents.map((t) => (
-            <TorrentRow key={t.hash} torrent={t} />
+            <TorrentRow key={t.hash} torrent={t} server={context} />
           ))}
           {data.total > 0 && (
             <>
+              {data.total > data.torrents.length && (
+                <PanelSectionRow>
+                  <ButtonItem layout="below" onClick={() => openPage(TORRENTS_ROUTE)}>
+                    All {data.total} torrents...
+                  </ButtonItem>
+                </PanelSectionRow>
+              )}
               <PanelSectionRow>
                 <ButtonItem layout="below" onClick={async () => failed(await torrentAction("start", "all"), "Start all")}>
                   Start all
@@ -278,6 +340,8 @@ function Content() {
         </PanelSection>
       )}
 
+      {online && server && <ServerSection server={server} />}
+
       <UpdatesSection update={update} name={PLUGIN_NAME} check={() => backend.checkUpdate(true)} />
       <PanelSection title="Settings">
         <PanelSectionRow>
@@ -286,16 +350,34 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
         {showSettings && (
-          <ConnectionForm
-            snapshot={snap}
-            backend={backend}
-            onSnapshot={apply}
-            secretFields={keyFields}
-            urlPlaceholder="http://192.168.x.x:8090"
-            urlDescription="The WebUI address, for example http://192.168.x.x:8090 or https://qbt.example.com."
-          >
-            <AuthFields snapshot={snap} onSnapshot={apply} />
-          </ConnectionForm>
+          <>
+            <ConnectionForm
+              snapshot={snap}
+              backend={backend}
+              onSnapshot={apply}
+              secretFields={keyFields}
+              urlPlaceholder="http://192.168.x.x:8090"
+              urlDescription="The WebUI address, for example http://192.168.x.x:8090 or https://qbt.example.com."
+            >
+              <AuthFields snapshot={snap} onSnapshot={apply} />
+            </ConnectionForm>
+            <PanelSectionRow>
+              <ToggleField
+                label="Alternative speed while gaming"
+                description={
+                  <span style={note}>
+                    Turns on alternative speed limits when a game starts and off when it ends. Leaves them alone if
+                    you had them on already.
+                  </span>
+                }
+                checked={snap.settings.game_alt_speed}
+                onChange={async (v) => {
+                  const res = await backend.saveSettings({ game_alt_speed: v });
+                  if (res.snapshot) apply(res.snapshot);
+                }}
+              />
+            </PanelSectionRow>
+          </>
         )}
         <PanelSectionRow>
           <Field label="Version" bottomSeparator="none" focusable={false}>
@@ -308,6 +390,11 @@ function Content() {
 }
 
 export default definePlugin(() => {
+  routerHook.addRoute(TORRENTS_ROUTE, () => (
+    <PanelBoundary>
+      <TorrentsPage />
+    </PanelBoundary>
+  ));
   const onNotify = addEventListener<[Toast]>("notify", (toast) => {
     if (shouldToast(toast.key)) toaster.toast({ title: toast.title, body: toast.body });
   });
@@ -325,6 +412,7 @@ export default definePlugin(() => {
     ),
     icon: <FaMagnet />,
     onDismount() {
+      routerHook.removeRoute(TORRENTS_ROUTE);
       removeEventListener("notify", onNotify);
       stopWatching();
     },

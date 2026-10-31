@@ -2,9 +2,12 @@
 
 A Decky Loader plugin. Watch and control a qBittorrent server from the Quick Access Menu on any Decky handheld.
 
-- Download and upload speed, connection state and the alternative speed limit toggle.
-- The 8 most active torrents with progress, ETA, speed and state.
-- Start, stop, recheck and delete per torrent. Start all and stop all.
+- Download and upload speed, how much is left and roughly how long.
+- The 8 most active torrents with progress, ETA, speed and state. A full-screen list of every torrent, with filters by state and category and four sort orders.
+- Start, stop, force start, recheck, reannounce, move to the top or bottom of the queue, change category and delete per torrent. Start all and stop all.
+- Download and upload limit sliders, the alternative speed limit toggle, and Pause all traffic on qBittorrent 5.3 or newer, which holds every torrent as it is.
+- Free space, session totals, all-time ratio, and a warning when qBittorrent is firewalled or disconnected.
+- Optional: turn on alternative speed limits while a game runs, and back off when it ends. Off by default.
 - A toast when a download completes or a torrent hits an error. Optional during games.
 
 Issues and source: [breakmylegs/decky-plugins](https://github.com/breakmylegs/decky-plugins). This repo is a mirror for releases.
@@ -62,7 +65,7 @@ To follow after on-device testing.
 
 | Component | Version |
 |---|---|
-| qBittorrent | 5.2 and 5.3 (API key needs 5.2 or newer). 4.6 and later best effort |
+| qBittorrent | 5.2 and 5.3 (API key needs 5.2 or newer, Pause all traffic needs 5.3). 4.6 and later best effort |
 | Decky Loader | 3.0 and later. 3.3.0 tested |
 
 ## Data and privacy

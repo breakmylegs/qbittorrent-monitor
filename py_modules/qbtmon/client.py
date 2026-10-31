@@ -16,7 +16,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from plugin_core.errors import AUTH, BAD_RESPONSE, FORBIDDEN, PluginError, from_status
+from plugin_core.errors import AUTH, BAD_RESPONSE, FORBIDDEN, HTTP_ERROR, PluginError, from_status
 from plugin_core.http import BaseUrl, HttpClient, Response, TlsOptions
 
 API = "api/v2/"
@@ -27,6 +27,15 @@ AUTH_MODES = (MODE_API_KEY, MODE_PASSWORD, MODE_NONE)
 
 # WebAPI 2.11.0 (qBittorrent 5.0) renamed pause and resume to stop and start.
 START_STOP_SINCE = (2, 11, 0)
+# WebAPI 2.16.2 (qBittorrent 5.3.0) added transfer/pauseSession and resumeSession.
+SESSION_PAUSE_SINCE = (2, 16, 2)
+
+QUEUE_MOVES = {"top": "topPrio", "bottom": "bottomPrio", "up": "increasePrio", "down": "decreasePrio"}
+# The largest limit accepted, in bytes per second. Guards against typos only.
+MAX_LIMIT = 10_000_000_000
+
+HINT_QUEUEING_OFF = "Torrent queueing is off. Turn it on in qBittorrent, Options, BitTorrent, to change the order."
+HINT_NO_CATEGORY = "qBittorrent has no category with that name. Refresh and pick again."
 
 
 def parse_api_version(text: str) -> tuple[int, ...]:
@@ -178,3 +187,62 @@ class QbtClient:
 
     def delete(self, hashes: Iterable[str] | str, delete_files: bool) -> None:
         self._post("torrents/delete", hashes=join_hashes(hashes), deleteFiles=bool(delete_files))
+
+    def set_force_start(self, hashes: Iterable[str] | str, value: bool) -> None:
+        self._post("torrents/setForceStart", hashes=join_hashes(hashes), value=bool(value))
+
+    def reannounce(self, hashes: Iterable[str] | str) -> None:
+        self._post("torrents/reannounce", hashes=join_hashes(hashes))
+
+    def queue_move(self, hashes: Iterable[str] | str, where: str) -> None:
+        if where not in QUEUE_MOVES:
+            raise ValueError("unknown queue move")
+        try:
+            self._post(f"torrents/{QUEUE_MOVES[where]}", hashes=join_hashes(hashes))
+        except PluginError as err:
+            if err.status == 409:
+                raise PluginError(HTTP_ERROR, "queueing off", 409, hint=HINT_QUEUEING_OFF) from None
+            raise
+
+    def set_category(self, hashes: Iterable[str] | str, category: str) -> None:
+        """An empty name removes the category."""
+        try:
+            self._post("torrents/setCategory", hashes=join_hashes(hashes), category=category)
+        except PluginError as err:
+            if err.status == 409:
+                raise PluginError(HTTP_ERROR, "no such category", 409, hint=HINT_NO_CATEGORY) from None
+            raise
+
+    def set_alt_speed(self, enabled: bool) -> None:
+        """Set the mode outright, so a repeat or a race cannot flip it the wrong way.
+        Servers without transfer/setSpeedLimitsMode answer 404, so read and toggle."""
+        try:
+            self._post("transfer/setSpeedLimitsMode", mode=1 if enabled else 0)
+            return
+        except PluginError as err:
+            if err.status != 404:
+                raise
+        if self.speed_limits_mode() != bool(enabled):
+            self.toggle_alt_speed()
+
+    def set_download_limit(self, limit: int) -> None:
+        """Bytes per second for the current mode, normal or alternative. 0 means no limit."""
+        self._post("transfer/setDownloadLimit", limit=_check_limit(limit))
+
+    def set_upload_limit(self, limit: int) -> None:
+        self._post("transfer/setUploadLimit", limit=_check_limit(limit))
+
+    def supports_session_pause(self) -> bool:
+        return self._ensure_version() >= SESSION_PAUSE_SINCE
+
+    def pause_session(self) -> None:
+        self._post("transfer/pauseSession")
+
+    def resume_session(self) -> None:
+        self._post("transfer/resumeSession")
+
+
+def _check_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= MAX_LIMIT:
+        raise ValueError("limit must be 0 or more bytes per second")
+    return limit

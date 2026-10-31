@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any
 
 from plugin_core import conntest
@@ -10,22 +11,28 @@ from plugin_core.errors import BAD_RESPONSE, FORBIDDEN, PluginError, classify
 from plugin_core.http import TlsOptions, parse_base_url
 from plugin_core.service import MonitorService
 
-from .client import AUTH_MODES, MODE_API_KEY, MODE_NONE, MODE_PASSWORD, Credentials, QbtClient
-from .sync import MainData, TransitionTracker, project
+from .client import AUTH_MODES, MAX_LIMIT, MODE_API_KEY, MODE_NONE, MODE_PASSWORD, QUEUE_MOVES, Credentials, QbtClient
+from .sync import MainData, TransitionTracker, list_torrents, project
 
-ACTIONS = ("start", "stop", "recheck")
+ACTIONS = ("start", "stop", "recheck", "reannounce")
+LIMIT_DIRECTIONS = ("download", "upload")
+
+
+def _bad(message: str) -> dict[str, Any]:
+    return {"ok": False, "error": {"kind": "bad_response", "message": message}}
 
 
 class QbtService(MonitorService):
     plugin_id = "qbittorrent-monitor"
     secret_names = ("api_key", "password")
-    extra_defaults = {"auth_mode": MODE_API_KEY, "username": ""}
+    extra_defaults = {"auth_mode": MODE_API_KEY, "username": "", "game_alt_speed": False}
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.client: QbtClient | None = None
         self.maindata = MainData()
         self.tracker = TransitionTracker()
+        self._game_mutex = threading.Lock()
 
     connection_keys = frozenset({"base_url", "tls_verify", "ca_file", "auth_mode", "username"})
 
@@ -72,6 +79,12 @@ class QbtService(MonitorService):
         except ValueError:
             self.maindata.reset()
             raise PluginError(BAD_RESPONSE, "maindata shape") from None
+        if self.game_ended_undo_due():
+            # The undo at game end failed, for example while offline. Try again now.
+            try:
+                self._undo_game_change(client, from_poll=True)
+            except Exception as exc:  # noqa: BLE001, classified
+                self.log.warning("game-time undo failed: %s", classify(exc).kind)
         return self.maindata
 
     async def fetch(self) -> MainData:
@@ -104,6 +117,85 @@ class QbtService(MonitorService):
     async def toggle_alt_speed(self) -> dict[str, Any]:
         client = self.get_client()
         return await self.run_action(client.toggle_alt_speed)
+
+    async def set_force_start(self, hashes: list[str], value: bool) -> dict[str, Any]:
+        client = self.get_client()
+        return await self.run_action(lambda: client.set_force_start(hashes, bool(value)))
+
+    async def queue_move(self, hashes: list[str], where: str) -> dict[str, Any]:
+        if where not in QUEUE_MOVES:
+            return _bad("Unknown queue move.")
+        client = self.get_client()
+        return await self.run_action(lambda: client.queue_move(hashes, where))
+
+    async def set_category(self, hashes: list[str], category: str) -> dict[str, Any]:
+        if not isinstance(category, str):
+            return _bad("Pick a category.")
+        if category and category not in self.maindata.categories:
+            return _bad("qBittorrent has no category with that name. Refresh and pick again.")
+        client = self.get_client()
+        return await self.run_action(lambda: client.set_category(hashes, category))
+
+    async def set_speed_limit(self, direction: str, limit: int) -> dict[str, Any]:
+        if direction not in LIMIT_DIRECTIONS:
+            return _bad("Unknown limit.")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= MAX_LIMIT:
+            return _bad("Pick a limit from the list.")
+        client = self.get_client()
+        fn = client.set_download_limit if direction == "download" else client.set_upload_limit
+        return await self.run_action(lambda: fn(limit))
+
+    async def set_session_paused(self, paused: bool) -> dict[str, Any]:
+        client = self.get_client()
+
+        def run() -> None:
+            if not client.supports_session_pause():
+                raise PluginError(BAD_RESPONSE, "no session pause", hint="Pausing all traffic needs qBittorrent 5.3 or newer.")
+            if paused:
+                client.pause_session()
+            else:
+                client.resume_session()
+
+        return await self.run_action(run)
+
+    def list_torrents(self, filter_id: str, category: str | None, sort: str) -> dict[str, Any]:
+        """Served from the maindata cache, with no extra request to the server."""
+        try:
+            return {"ok": True, **list_torrents(self.maindata, filter_id, category, sort)}
+        except ValueError as err:
+            return _bad(str(err).capitalize() + ".")
+
+    # Game-time alternative speed (opt-in)
+
+    def game_changed_blocking(self, running: bool) -> None:
+        client = self.get_client()
+        if not running:
+            self._undo_game_change(client)
+            return
+        with self._game_mutex:
+            if not self.settings.get("game_alt_speed") or self.game_change():
+                return
+            if client.speed_limits_mode():
+                # Already on, so the user chose it. Leave it alone afterwards too.
+                return
+            client.set_alt_speed(True)
+            self.remember_game_change({"alt_speed": True})
+        self.log.info("game started, alternative speed limits on")
+
+    def _undo_game_change(self, client: QbtClient, from_poll: bool = False) -> None:
+        # The game-end task and a poll can both get here. The mutex stops a double toggle.
+        with self._game_mutex:
+            if from_poll and not self.game_ended_undo_due():
+                # A game started while this poll ran.
+                return
+            record = self.game_change()
+            if not record:
+                return
+            if record.get("alt_speed") and client.speed_limits_mode():
+                client.set_alt_speed(False)
+                self.log.info("game ended, alternative speed limits off")
+            # Cleared even when the user turned it off during the game.
+            self.game_memory.clear()
 
     # Connection test
 
